@@ -5,10 +5,11 @@
 #include <ESP32Servo.h>
 
 // === Pins ===
-#define LED_PIN     15
-#define SERVO_PIN   2
-#define SS_PIN      5    // RFID SDA (SS)
-#define BUZZER_PIN  4
+#define LED_PIN      15
+#define SERVO_PIN    2
+#define SS_PIN       5    // RFID SDA (SS)
+#define BUZZER_PIN   4
+#define PIR_PIN      27
 #define LUX_THRESHOLD 150
 
 // === BH1750 Setup ===
@@ -24,6 +25,7 @@ Servo doorServo;
 
 // === Task Handles ===
 TaskHandle_t lightTaskHandle;
+TaskHandle_t pirTaskHandle;
 
 // === Shared flag ===
 bool personInside = false;
@@ -35,6 +37,8 @@ void setup() {
 
   pinMode(LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(PIR_PIN, INPUT);
+
   digitalWrite(LED_PIN, LOW);
   digitalWrite(BUZZER_PIN, LOW);
 
@@ -47,11 +51,9 @@ void setup() {
   rfid.PCD_Init();
 
   // Create Tasks
-  xTaskCreatePinnedToCore(
-    RFIDMonitorTask, "RFID Monitor", 4096, NULL, 2, NULL, 1);
-
-  xTaskCreatePinnedToCore(
-    LightMonitorTask, "Light Monitor", 2048, NULL, 1, &lightTaskHandle, 0);
+  xTaskCreatePinnedToCore(RFIDMonitorTask, "RFID Monitor", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(LightMonitorTask, "Light Monitor", 2048, NULL, 1, &lightTaskHandle, 0);
+  xTaskCreatePinnedToCore(PIRMonitorTask, "PIR Monitor", 2048, NULL, 1, &pirTaskHandle, 0);
 
   Serial.println("System Ready. Waiting for RFID...");
 }
@@ -117,6 +119,20 @@ void LightMonitorTask(void *pvParameters) {
       }
     }
     vTaskDelay(5000 / portTICK_PERIOD_MS); // Check every 5 seconds
+  }
+}
+
+// === Task: PIR Monitoring ===
+void PIRMonitorTask(void *pvParameters) {
+  for (;;) {
+    int motionDetected = digitalRead(PIR_PIN);
+    if (!personInside && motionDetected == HIGH) {
+      Serial.println("Intrusion detected! PIR triggered while door is closed.");
+      digitalWrite(BUZZER_PIN, HIGH);
+      vTaskDelay(2000 / portTICK_PERIOD_MS); // Buzzer active
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+    vTaskDelay(300 / portTICK_PERIOD_MS); // PIR polling delay
   }
 }
 
