@@ -1,35 +1,41 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
 #include <Wire.h>
 #include <BH1750.h>
 #include <MFRC522.h>
 #include <SPI.h>
 #include <ESP32Servo.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include "web.h"
 
-#define LED_PIN      15
-#define SERVO_PIN    2
-#define SS_PIN       5
-#define BUZZER_PIN   4
-#define PIR_PIN      27
+#include "index.h"
+
+#define LED_PIN 15
+#define SERVO_PIN 2
+#define SS_PIN 5
+#define BUZZER_PIN 4
+#define PIR_PIN 27
 #define LUX_THRESHOLD 150
 
+const char* ssid = "ESP32-SmartRoom";
+const char* password = nullptr;
+
+AsyncWebServer server(80);
 BH1750 lightMeter;
-bool monitorLight = false;
-
 MFRC522 rfid(SS_PIN, -1);
-String authorizedUID = "DC 71 55 49";
-
 Servo doorServo;
+
+bool personInside = false;
+bool monitorLight = false;
+bool intrusionAlert = false;
+bool unauthAccess = false;
+bool doorJustClosed = false;
 
 TaskHandle_t lightTaskHandle;
 TaskHandle_t pirTaskHandle;
+SemaphoreHandle_t serialMutex;
 
-bool personInside = false;
-
-const char* ssid = "yourSSID";
-const char* password = "yourPASSWORD";
-WebServer server(80);
+String authorizedUID = "43 BF AF F8";
 
 void setup() {
   Serial.begin(115200);
@@ -38,79 +44,86 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(PIR_PIN, INPUT);
-
   digitalWrite(LED_PIN, LOW);
   digitalWrite(BUZZER_PIN, LOW);
 
   doorServo.attach(SERVO_PIN);
   doorServo.write(0);
 
-  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
-
+  lightMeter.begin();
   SPI.begin(18, 19, 23, SS_PIN);
   rfid.PCD_Init();
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.print("Connected! IP address: ");
-  Serial.println(WiFi.localIP());
+  serialMutex = xSemaphoreCreateMutex();
 
-  server.on("/", handleRoot);
-  server.on("/toggle", handleToggle);
-  server.on("/mode", handleMode);
-  server.on("/alarm", handleAlarm);
+  WiFi.softAP(ssid);
+  log("WiFi Access Point started");
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", MAIN_page);
+  });
+
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request){
+    DynamicJsonDocument doc(512);
+    doc["personInside"] = personInside;
+    doc["monitorLight"] = monitorLight;
+    doc["intrusionAlert"] = intrusionAlert;
+    doc["unauthAccess"] = unauthAccess;
+    doc["roomMode"] = personInside ? "open" : "closed";
+
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  server.on("/toggle-light", HTTP_POST, [](AsyncWebServerRequest *request){
+    monitorLight = !monitorLight;
+    if (!monitorLight) digitalWrite(LED_PIN, LOW);
+    request->send(200, "text/plain", "OK");
+  });
+
   server.begin();
-  Serial.println("HTTP server started");
 
-  xTaskCreatePinnedToCore(RFIDMonitorTask, "RFID Monitor", 4096, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(LightMonitorTask, "Light Monitor", 2048, NULL, 1, &lightTaskHandle, 0);
-  xTaskCreatePinnedToCore(PIRMonitorTask, "PIR Monitor", 2048, NULL, 1, &pirTaskHandle, 0);
-
-  Serial.println("System Ready. Waiting for RFID...");
+  xTaskCreatePinnedToCore(RFIDMonitorTask, "RFID Task", 4096, nullptr, 2, nullptr, 1);
+  xTaskCreatePinnedToCore(LightMonitorTask, "Light Task", 2048, nullptr, 1, &lightTaskHandle, 0);
+  xTaskCreatePinnedToCore(PIRMonitorTask, "PIR Task", 2048, nullptr, 1, &pirTaskHandle, 0);
 }
 
-void loop() {
-  server.handleClient();
-}
+void loop() {}
 
 void RFIDMonitorTask(void *pvParameters) {
   for (;;) {
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
       String uid = getUID();
-      Serial.print("Scanned UID: ");
-      Serial.println(uid);
+      log("Scanned UID: " + uid);
 
       if (uid == authorizedUID) {
         personInside = !personInside;
+        unauthAccess = false;
 
-        if (personInside) {
-          Serial.println("Entry detected. Opening door...");
-          doorServo.write(90);
-          delay(1000);
-          Serial.println("Enabling light monitoring...");
-          monitorLight = true;
-        } else {
-          Serial.println("Exit detected. Closing door and turning off LED...");
-          doorServo.write(0);
-          monitorLight = false;
+        doorServo.write(90);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        doorServo.write(0);
+
+        monitorLight = personInside;
+        if (!monitorLight) {
           digitalWrite(LED_PIN, LOW);
+          doorJustClosed = true;
         }
+
       } else {
-        Serial.println("Unauthorized UID. Triggering buzzer...");
+        log("Unauthorized UID. Triggering buzzer...");
+        unauthAccess = true;
         digitalWrite(BUZZER_PIN, HIGH);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(300));
         digitalWrite(BUZZER_PIN, LOW);
       }
 
       rfid.PICC_HaltA();
       rfid.PCD_StopCrypto1();
-      vTaskDelay(2000 / portTICK_PERIOD_MS);
+      vTaskDelay(pdMS_TO_TICKS(300));
     }
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(80));
   }
 }
 
@@ -118,31 +131,30 @@ void LightMonitorTask(void *pvParameters) {
   for (;;) {
     if (monitorLight) {
       float lux = lightMeter.readLightLevel();
-      Serial.print("Ambient Lux: ");
-      Serial.println(lux);
-
-      if (lux < LUX_THRESHOLD) {
-        digitalWrite(LED_PIN, HIGH);
-        Serial.println("It's dark. Turning on LED.");
-      } else {
-        digitalWrite(LED_PIN, LOW);
-        Serial.println("It's bright. Turning off LED.");
-      }
+      log("Lux: " + String(lux));
+      digitalWrite(LED_PIN, lux < LUX_THRESHOLD ? HIGH : LOW);
     }
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(1500));
   }
 }
 
 void PIRMonitorTask(void *pvParameters) {
   for (;;) {
-    int motionDetected = digitalRead(PIR_PIN);
-    if (!personInside && motionDetected == HIGH) {
-      Serial.println("Intrusion detected! PIR triggered while door is closed.");
-      digitalWrite(BUZZER_PIN, HIGH);
-      vTaskDelay(2000 / portTICK_PERIOD_MS);
-      digitalWrite(BUZZER_PIN, LOW);
+    if (doorJustClosed) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      doorJustClosed = false;
     }
-    vTaskDelay(300 / portTICK_PERIOD_MS);
+
+    if (!personInside && digitalRead(PIR_PIN) == HIGH) {
+      log("PIR Intrusion! Triggering buzzer.");
+      intrusionAlert = true;
+      digitalWrite(BUZZER_PIN, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(700));
+      digitalWrite(BUZZER_PIN, LOW);
+    } else {
+      intrusionAlert = false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(80));
   }
 }
 
@@ -157,31 +169,9 @@ String getUID() {
   return uid;
 }
 
-void handleRoot() {
-  server.send(200, "text/html", htmlPage);
-}
-
-void handleToggle() {
-  String device = server.arg("device");
-  String state = server.arg("state");
-  bool on = state == "1";
-
-  if (device == "light") {
-    digitalWrite(LED_PIN, on ? HIGH : LOW);
-  } else if (device == "fan") {
+void log(String message) {
+  if (xSemaphoreTake(serialMutex, portMAX_DELAY)) {
+    Serial.println(message);
+    xSemaphoreGive(serialMutex);
   }
-  server.send(200, "text/plain", "OK");
-}
-
-void handleMode() {
-  String mode = server.arg("mode");
-  Serial.print("Mode switched to: ");
-  Serial.println(mode);
-  server.send(200, "text/plain", "Mode set");
-}
-
-void handleAlarm() {
-  Serial.println("Alarm off trigger received.");
-  digitalWrite(BUZZER_PIN, LOW);
-  server.send(200, "text/plain", "Alarm turned off");
 }
